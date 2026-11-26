@@ -25,7 +25,8 @@ python_sources = [
   'hough_transform.py',
   'integral.py',
   'pyramids.py',
-  'radon_transform.py'
+  'radon_transform.py',
+  'seam_carve.py'
 ]
 
 py3.install_sources(

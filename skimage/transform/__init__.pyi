@@ -41,6 +41,7 @@ __all__ = [
     'pyramid_expand',
     'pyramid_gaussian',
     'pyramid_laplacian',
+    'seam_carve',
 ]
 
 from .hough_transform import (
@@ -84,3 +85,4 @@ from .pyramids import (
     pyramid_gaussian,
     pyramid_laplacian,
 )
+from .seam_carve import seam_carve

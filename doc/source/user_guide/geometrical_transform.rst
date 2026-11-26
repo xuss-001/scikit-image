@@ -32,6 +32,21 @@ functions described in :ref:`sphx_glr_auto_examples_transform_plot_rescale.py`
    :align: center
    :width: 80%
 
+Content-aware resizing with seam carving
+----------------------------------------
+
+Resizing an image to a different aspect ratio either distorts its content or
+crops it away. :func:`seam_carve` instead removes connected paths of
+low-energy pixels ("seams"), compressing unimportant background while
+preserving visually important structures. An optional boolean ``mask`` marks
+pixels that must never be removed; when the requested target size cannot be
+reached without touching the masked region, :func:`seam_carve` raises a
+``ValueError`` instead of degrading the protected content. Only grayscale and
+RGB images can be reduced in size; upscaling is not supported.
+
+See :ref:`sphx_glr_auto_examples_transform_plot_seam_carving.py` for a
+comparison of resizing, center cropping and mask-protected seam carving.
+
 Projective transforms (homographies)
 ------------------------------------
 
