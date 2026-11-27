@@ -41,6 +41,10 @@ __all__ = [
     'pyramid_expand',
     'pyramid_gaussian',
     'pyramid_laplacian',
+    'stitch_images',
+    'stitch',
+    'panorama',
+    'panorama_stitch',
 ]
 
 from .hough_transform import (
@@ -84,3 +88,4 @@ from .pyramids import (
     pyramid_gaussian,
     pyramid_laplacian,
 )
+from ._stitching import stitch_images, stitch, panorama, panorama_stitch

@@ -19,6 +19,7 @@ python_sources = [
   '__init__.py',
   '__init__.pyi',
   '_geometric.py',
+  '_stitching.py',
   '_thin_plate_splines.py',
   '_warps.py',
   'finite_radon_transform.py',

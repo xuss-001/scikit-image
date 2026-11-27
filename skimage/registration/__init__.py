@@ -1,4 +1,5 @@
-"""Image registration algorithms, e.g., optical flow or phase cross correlation."""
+"""Image registration algorithms, e.g., optical flow, phase cross correlation,
+and panorama stitching."""
 
 import lazy_loader as _lazy
 

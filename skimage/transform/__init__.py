@@ -30,6 +30,11 @@
   Examples: :func:`~skimage.transform.warp`,
   :func:`~skimage.transform.iradon`.
 
+- Panorama stitching:
+  Combine overlapping images into one composite image using point
+  correspondences.
+  Examples: :func:`~skimage.transform.stitch_images`.
+
 """
 
 import lazy_loader as _lazy
