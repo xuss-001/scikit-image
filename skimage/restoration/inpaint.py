@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 import scipy.ndimage as ndi
@@ -336,5 +337,304 @@ def inpaint_biharmonic(image, mask, *, split_into_regions=False, channel_axis=No
 
     if not multichannel:
         out = out[..., 0]
+
+    return out
+
+
+@utils.channel_as_last_axis()
+def inpaint_texture(
+    image,
+    mask,
+    *,
+    source_mask=None,
+    patch_size=9,
+    search_radius=None,
+    channel_axis=None,
+):
+    """Inpaint masked points using exemplars from intact parts of the image.
+
+    This function fills the masked region with small patches sampled from
+    intact parts of the image.  Unlike :func:`inpaint_biharmonic`, which favors
+    smooth interpolation, this method is intended for structured or periodic
+    textures such as wood grain, brickwork, and painted lines.  The fill order
+    favors boundary pixels with strong structure, so visible lines and texture
+    can continue across the masked region.
+
+    Candidate source patches are never taken from the masked region.  If
+    ``source_mask`` is given, candidate patches must be entirely contained in
+    the allowed part of ``source_mask``.  Pixels outside ``mask`` are copied
+    unchanged from the input, and the input array is never modified.
+
+    Parameters
+    ----------
+    image : (M, N[, C]) ndarray
+        Input grayscale or RGB image.
+    mask : (M, N) ndarray
+        Array of pixels to be inpainted.  Unknown pixels must be nonzero and
+        known pixels zero.
+    source_mask : (M, N) ndarray, optional
+        Selection of pixels that may be used as source material.  ``True``
+        marks allowed pixels.  Pixels in ``mask`` are always excluded from the
+        source, even when they are ``True`` in ``source_mask``.  By default,
+        all pixels outside ``mask`` may be used.
+    patch_size : int, optional
+        Side length of the square texture patches.  Must be an odd integer
+        greater than or equal to 3.  Larger patches preserve larger-scale
+        structure, but require a correspondingly larger source area.
+    search_radius : int, optional
+        Maximum distance, in pixels, between a fill pixel and a candidate
+        source patch center.  By default, source patches from the whole allowed
+        region are considered.
+    channel_axis : int or None, optional
+        If None, the image is assumed to be grayscale.  Otherwise, this
+        parameter indicates which axis of the array corresponds to channels.
+
+    Returns
+    -------
+    out : (M, N[, C]) ndarray
+        Input image with masked pixels inpainted.  The output has the same
+        dtype as ``image``.
+
+    Raises
+    -------
+    ValueError
+        If the image or masks have incompatible shapes, if the patch size or
+        search radius is invalid, or if no complete source patch is available
+        in the allowed region.
+
+    Notes
+    -----
+    The algorithm follows the exemplar-based inpainting strategy of
+    Criminisi et al. [1]_.  The highest-priority boundary pixel is chosen
+    using a confidence term and an isophote term.  Its neighborhood is
+    compared against every permitted source patch, and only the missing
+    pixels in that neighborhood are filled.  Since many overlapping patches
+    are used, the result is not a single copied rectangle or a uniform fill.
+
+    References
+    ----------
+    .. [1] A. Criminisi, P. Perez, and K. Toyama, "Region Filling and Object
+           Removal by Exemplar-Based Image Inpainting", IEEE Transactions on
+           Image Processing, 13(9), 1200-1212, 2004.
+           :DOI:`10.1109/TIP.2004.834113`
+
+    Examples
+    --------
+    >>> img = np.zeros((15, 25))
+    >>> img[:, 1::3] = 1
+    >>> img[7:9, :] = 0.2
+    >>> mask = np.zeros_like(img, dtype=bool)
+    >>> mask[6:12, 10:16] = True
+    >>> out = inpaint_texture(img, mask, patch_size=9)
+    >>> out.shape == img.shape
+    True
+    >>> np.array_equal(out[~mask], img[~mask])
+    True
+    """
+    if np.ma.isMaskedArray(image):
+        raise TypeError('Masked arrays are not supported')
+    image = np.asarray(image)
+    if image.ndim not in (2, 3):
+        raise ValueError('Input image must be a 2D grayscale or RGB image')
+    if image.size == 0:
+        raise ValueError('Input image must not be empty')
+
+    multichannel = image.ndim == 3
+    base_shape = image.shape[:-1] if multichannel else image.shape
+    if multichannel and image.shape[-1] == 0:
+        raise ValueError('Input image must have at least one channel')
+
+    mask = np.asarray(mask)
+    if mask.shape != base_shape:
+        raise ValueError('mask must have the same shape as the image')
+    mask = mask.astype(bool, copy=False)
+
+    if source_mask is not None:
+        source_mask = np.asarray(source_mask)
+        if source_mask.shape != base_shape:
+            raise ValueError(
+                'source_mask must have the same shape as the image'
+            )
+        source_mask = source_mask.astype(bool, copy=False)
+
+    if (
+        not isinstance(patch_size, (int, np.integer))
+        or patch_size < 3
+        or patch_size % 2 == 0
+    ):
+        raise ValueError(
+            'patch_size must be an odd integer greater than or equal to 3'
+        )
+    if search_radius is not None:
+        if (
+            not isinstance(search_radius, (int, np.integer))
+            or search_radius < 0
+        ):
+            raise ValueError(
+                'search_radius must be a nonnegative integer or None'
+            )
+
+    out = np.copy(image, order='C')
+    if not mask.any():
+        return out
+
+    # Work in floating point for distances and gradients, but write sampled
+    # pixel values directly to ``out`` so that the input dtype and all
+    # unmasked values are preserved exactly.
+    work = np.array(image, dtype=np.float64, copy=True)
+    if not multichannel:
+        work = work[..., np.newaxis]
+    n_channels = work.shape[-1]
+
+    if not multichannel or n_channels == 1:
+        gray = work[..., 0]
+    elif n_channels >= 3:
+        gray = work[..., :3] @ np.array([0.2126, 0.7152, 0.0722])
+    else:
+        gray = work.mean(axis=-1)
+
+    allowed_source = ~mask
+    if source_mask is not None:
+        allowed_source &= source_mask
+
+    radius = patch_size // 2
+    full_patch_allowed = (
+        ndi.minimum_filter(
+            allowed_source.astype(np.uint8),
+            size=patch_size,
+            mode='constant',
+            cval=0,
+        )
+        == 1
+    )
+    source_centers = np.argwhere(full_patch_allowed)
+    rows, cols = gray.shape
+    source_centers = source_centers[
+        (source_centers[:, 0] >= radius)
+        & (source_centers[:, 0] <= rows - radius - 1)
+        & (source_centers[:, 1] >= radius)
+        & (source_centers[:, 1] <= cols - radius - 1)
+    ]
+    if source_centers.size == 0:
+        raise ValueError(
+            'No complete source patch of size '
+            f'{patch_size} x {patch_size} is available in the allowed region'
+        )
+
+    source_patches = sliding_window_view(
+        work, (patch_size, patch_size), axis=(0, 1)
+    )
+    filled = ~mask
+    pending = np.copy(mask)
+    confidence = filled.astype(np.float64)
+    structure = ndi.generate_binary_structure(2, 1)
+
+    while pending.any():
+        eroded_pending = ndi.binary_erosion(
+            pending, structure=structure, border_value=0
+        )
+        fill_front = pending & ~eroded_pending
+        if not fill_front.any():
+            fill_front = pending
+
+        confidence_term = ndi.uniform_filter(
+            confidence, size=patch_size, mode='constant', cval=0
+        )
+
+        filled_float = ndi.gaussian_filter(filled.astype(np.float64), 1.0)
+        normal_y, normal_x = np.gradient(filled_float)
+        normal_norm = np.hypot(normal_x, normal_y)
+        normal_norm[normal_norm == 0] = 1
+
+        gradient_y, gradient_x = np.gradient(
+            ndi.gaussian_filter(gray, 1.0)
+        )
+        data_term = np.abs(
+            (-gradient_y * normal_x + gradient_x * normal_y) / normal_norm
+        )
+        priority = np.where(
+            fill_front,
+            confidence_term * (data_term + 0.01),
+            -np.inf,
+        )
+        fill_y, fill_x = np.unravel_index(np.argmax(priority), priority.shape)
+
+        patch_y0 = max(0, fill_y - radius)
+        patch_y1 = min(rows, fill_y + radius + 1)
+        patch_x0 = max(0, fill_x - radius)
+        patch_x1 = min(cols, fill_x + radius + 1)
+        offset_y = np.arange(patch_y0 - fill_y, patch_y1 - fill_y)
+        offset_x = np.arange(patch_x0 - fill_x, patch_x1 - fill_x)
+
+        target_patch = work[patch_y0:patch_y1, patch_x0:patch_x1]
+        known_in_target = filled[patch_y0:patch_y1, patch_x0:patch_x1]
+        if not known_in_target.any():
+            raise ValueError(
+                'Cannot inpaint texture: the fill patch has no known context'
+            )
+
+        center_distance = np.sum(
+            (source_centers - np.array([fill_y, fill_x])) ** 2,
+            axis=1,
+        )
+        if search_radius is None:
+            candidate_indices = np.arange(source_centers.shape[0])
+        else:
+            candidate_indices = np.flatnonzero(
+                center_distance <= search_radius**2
+            )
+        if candidate_indices.size == 0:
+            raise ValueError(
+                'No allowed source patch is within '
+                f'search_radius={search_radius}'
+            )
+
+        # Score candidates in chunks to keep memory bounded for large images.
+        best_score = np.inf
+        best_patch = None
+        chunk_size = 2048
+        for start in range(0, candidate_indices.size, chunk_size):
+            stop = min(start + chunk_size, candidate_indices.size)
+            chunk_indices = candidate_indices[start:stop]
+            chunk_centers = source_centers[chunk_indices]
+            chunk_patches = source_patches[
+                chunk_centers[:, 0] - radius,
+                chunk_centers[:, 1] - radius,
+            ]
+            chunk_patches = np.moveaxis(chunk_patches, 1, -1)
+            chunk_patches = chunk_patches[:, offset_y + radius, :, :]
+            chunk_patches = chunk_patches[:, :, offset_x + radius, :]
+            difference = chunk_patches - target_patch[np.newaxis]
+            scores = np.sum(difference * difference, axis=(1, 2, 3))
+            scores += 1e-9 * center_distance[chunk_indices]
+            best_in_chunk = int(np.argmin(scores))
+            if scores[best_in_chunk] < best_score:
+                best_score = scores[best_in_chunk]
+                best_patch = chunk_patches[best_in_chunk]
+
+        if best_patch is None or not np.isfinite(best_score):
+            raise ValueError(
+                'No allowed source patch could be used to fill the mask'
+            )
+
+        pending_in_target = pending[patch_y0:patch_y1, patch_x0:patch_x1]
+        local_y, local_x = np.nonzero(pending_in_target)
+        source_y = offset_y[local_y] + radius
+        source_x = offset_x[local_x] + radius
+        sampled = best_patch[source_y, source_x]
+
+        out_patch = out[patch_y0:patch_y1, patch_x0:patch_x1]
+        if multichannel:
+            out_patch[local_y, local_x] = sampled
+        else:
+            out_patch[local_y, local_x] = sampled[:, 0]
+        target_patch[local_y, local_x] = sampled
+
+        confidence_value = confidence_term[fill_y, fill_x]
+        confidence_patch = confidence[patch_y0:patch_y1, patch_x0:patch_x1]
+        confidence_patch[pending_in_target] = confidence_value
+        filled_patch = filled[patch_y0:patch_y1, patch_x0:patch_x1]
+        filled_patch[pending_in_target] = True
+        pending_in_target[:] = False
 
     return out

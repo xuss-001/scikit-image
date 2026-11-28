@@ -184,3 +184,140 @@ def test_inpaint_nrmse(dtype, order, channel_axis, split_into_regions):
     nrmse_defect = normalized_root_mse(image_orig, image_defect)
     nrmse_result = normalized_root_mse(img_as_float(image_orig), image_result)
     assert nrmse_result < 0.2 * nrmse_defect
+
+
+def _make_textured_image(rgb=False):
+    height, width = 48, 64
+    yy, xx = np.mgrid[:height, :width]
+    image = ((xx // 4) % 2).astype(float) * 0.55 + 0.2
+    image[22:24, :] = 0.05
+
+    mask = np.zeros((height, width), dtype=bool)
+    mask[17:31, 28:37] = True
+
+    if rgb:
+        image = np.dstack([image, image * 0.6 + 0.1, image * 0.3])
+    return image, mask
+
+
+@testing.parametrize('rgb', [False, True])
+def test_inpaint_texture_continues_structure(rgb):
+    image, mask = _make_textured_image(rgb=rgb)
+    defective = image.copy()
+    defective[mask] = 0
+    original_input = defective.copy()
+    channel_axis = -1 if rgb else None
+
+    out = inpaint.inpaint_texture(
+        defective, mask, channel_axis=channel_axis
+    )
+    smooth = inpaint.inpaint_biharmonic(
+        defective, mask, channel_axis=channel_axis
+    )
+
+    assert out.dtype == defective.dtype
+    assert np.array_equal(out[~mask], defective[~mask])
+    assert np.array_equal(defective, original_input)
+
+    line_slice = (slice(22, 24), slice(28, 37))
+    assert out[line_slice].mean() < 0.1
+    assert smooth[line_slice].mean() > 0.12
+
+    assert out[mask].std() > smooth[mask].std()
+    mse_texture = np.mean((out[mask].astype(float) - image[mask]) ** 2)
+    mse_smooth = np.mean((smooth[mask].astype(float) - image[mask]) ** 2)
+    assert mse_texture < mse_smooth
+
+
+@testing.parametrize('channel_axis', [0, 1, -1])
+def test_inpaint_texture_rgb_channel_axis(channel_axis):
+    image, mask = _make_textured_image(rgb=True)
+    defective = image.copy()
+    defective[mask] = 0
+    defective = np.moveaxis(defective, -1, channel_axis)
+
+    out = inpaint.inpaint_texture(
+        defective, mask, channel_axis=channel_axis
+    )
+    out = np.moveaxis(out, channel_axis, -1)
+
+    assert out.shape == image.shape
+    assert np.array_equal(out[~mask], image[~mask])
+    assert out[22:24, 28:37].mean() < 0.1
+
+
+def test_inpaint_texture_source_mask_restriction():
+    image, mask = _make_textured_image()
+    defective = image.copy()
+    defective[mask] = 0
+
+    forbidden_value = 1.0
+    defective[3:13, 52:62] = forbidden_value
+    source_mask = np.ones(image.shape, dtype=bool)
+    source_mask[:, 50:] = False
+    original_input = defective.copy()
+
+    out = inpaint.inpaint_texture(
+        defective, mask, source_mask=source_mask
+    )
+
+    assert np.array_equal(out[~mask], defective[~mask])
+    assert np.array_equal(defective, original_input)
+    assert out[mask].max() <= image[mask].max()
+
+
+@testing.parametrize(
+    'source_mask',
+    [
+        np.zeros((48, 64), dtype=bool),
+        np.pad(
+            np.ones((3, 3), dtype=bool),
+            ((20, 25), (20, 41)),
+        ),
+    ],
+)
+def test_inpaint_texture_insufficient_source(source_mask):
+    image, mask = _make_textured_image()
+    defective = image.copy()
+    defective[mask] = 0
+    original_input = defective.copy()
+
+    with testing.raises(ValueError, match='No complete source patch'):
+        inpaint.inpaint_texture(
+            defective,
+            mask,
+            source_mask=source_mask,
+        )
+    assert np.array_equal(defective, original_input)
+
+
+def test_inpaint_texture_preserves_uint8_dtype():
+    image, mask = _make_textured_image()
+    defective = (image * 255).round().astype(np.uint8)
+    defective[mask] = 0
+    original_input = defective.copy()
+
+    out = inpaint.inpaint_texture(defective, mask, patch_size=9)
+
+    assert out.dtype == np.uint8
+    assert np.array_equal(out[~mask], defective[~mask])
+    assert np.array_equal(defective, original_input)
+
+
+def test_inpaint_texture_invalid_inputs():
+    image, mask = _make_textured_image()
+
+    masked_image = np.ma.array(image, mask=np.zeros_like(mask))
+    with testing.raises(TypeError, match='Masked arrays'):
+        inpaint.inpaint_texture(masked_image, mask)
+
+    with testing.raises(ValueError, match='same shape'):
+        inpaint.inpaint_texture(image, mask[:-1])
+
+    with testing.raises(ValueError, match='odd integer'):
+        inpaint.inpaint_texture(image, mask, patch_size=4)
+
+    with testing.raises(ValueError, match='source_mask'):
+        inpaint.inpaint_texture(
+            image, mask, source_mask=np.ones((47, 64), dtype=bool)
+        )
