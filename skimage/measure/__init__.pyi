@@ -28,6 +28,7 @@ __all__ = [
     'mesh_surface_area',
     'profile_line',
     'label',
+    'label_chunked',
     'points_in_poly',
     'grid_points_in_poly',
     'shannon_entropy',
@@ -65,6 +66,7 @@ from .profile import profile_line
 from .fit import LineModelND, CircleModel, EllipseModel, ransac
 from .block import block_reduce
 from ._label import label
+from ._label import label_chunked
 from .entropy import shannon_entropy
 from ._blur_effect import blur_effect
 from ._colocalization import (
